@@ -24,6 +24,8 @@ dist-full/
 # verifying it must not overwrite the build the released archive came from.
 build-slim/
 dist-slim/
+build-amd/
+dist-amd/
 *.manifest
 
 # IDE

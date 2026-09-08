@@ -3,12 +3,57 @@
 
 import os
 import sys
+import shutil
+import importlib.util
+import tempfile
 from pathlib import Path
-import faster_whisper
-import ctranslate2
-import tokenizers
 
 block_cipher = None
+
+# The requested package type is an explicit build input. Never infer intent
+# from the installed wheel: doing that can silently publish an AMD artifact
+# from a contaminated CUDA CI environment (or vice versa). CUDA is the stable
+# default, while an AMD build must opt in with WHISP_CARRIER_BACKEND=rocm.
+GPU_BACKEND = os.environ.get('WHISP_CARRIER_BACKEND', 'cuda').strip().lower()
+if GPU_BACKEND not in ('cuda', 'rocm'):
+    raise SystemExit(
+        '[spec] WHISP_CARRIER_BACKEND must be "cuda" or "rocm" '
+        f'(got {GPU_BACKEND!r}).'
+    )
+ROCM = GPU_BACKEND == 'rocm'
+DIST_NAME = 'whisp-carrier-amd' if ROCM else 'whisp-carrier'
+
+# Check the installed CTranslate2 wheel against the requested build type by
+# reading PE imports without loading the DLL. Windows CI needs no GPU or driver.
+_ct2_spec = importlib.util.find_spec('ctranslate2')
+if _ct2_spec is None or not _ct2_spec.submodule_search_locations:
+    raise SystemExit('[spec] ctranslate2 is not installed in the build environment.')
+_CT2_DIR = Path(next(iter(_ct2_spec.submodule_search_locations)))
+_CT2_DLL = _CT2_DIR / 'ctranslate2.dll'
+if not _CT2_DLL.is_file():
+    raise SystemExit(f'[spec] ctranslate2.dll not found at {_CT2_DLL}')
+
+try:
+    from whisp_backend import ctranslate2_is_rocm
+    _ct2_is_rocm = ctranslate2_is_rocm(_CT2_DLL)
+except Exception as exc:
+    raise SystemExit(
+        f'[spec] could not inspect CTranslate2 PE imports in {_CT2_DLL}: {exc}'
+    ) from exc
+
+if ROCM and not _ct2_is_rocm:
+    raise SystemExit(
+        '[spec] ROCm build requested, but the installed ctranslate2.dll is '
+        'not the ROCm wheel (hipblas.dll/amdhip64_7.dll imports are absent). '
+        'Install the official Windows ROCm wheel in this build environment.'
+    )
+if not ROCM and _ct2_is_rocm:
+    raise SystemExit(
+        '[spec] CUDA build requested (the default), but the installed '
+        'ctranslate2.dll is the ROCm wheel. Install the standard CUDA wheel, '
+        'or explicitly set WHISP_CARRIER_BACKEND=rocm for an AMD package.'
+    )
+print(f'[spec] requested backend: {GPU_BACKEND}; validated wheel: {_CT2_DLL}')
 
 # Collect data files from key packages
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
@@ -45,12 +90,27 @@ FULL = os.environ.get('WHISP_CARRIER_FULL') == '1'
 WITH_TORCH = FULL or os.environ.get('WHISP_CARRIER_WITH_TORCH') == '1'
 SLIM = not WITH_TORCH
 if SLIM:
-    print('[spec] default (slim): dropping torch, keeping only the CUDA '
-          'libraries CTranslate2 loads')
+    print(f'[spec] default (slim/{GPU_BACKEND}): dropping torch, keeping only '
+          'the GPU libraries CTranslate2 loads')
 else:
+    if ROCM:
+        raise SystemExit(
+            '[spec] WHISP_CARRIER_FULL/WITH_TORCH is not supported for the '
+            'ROCm build. Windows PyTorch in this environment is a CUDA build; '
+            'build the normal slim AMD package instead.'
+        )
     print('[spec] WITH_TORCH: bundling torch and the silero VAD backends')
 
-datas = []
+# Carry the explicit build choice into the frozen runtime. whisp_carrier.py
+# reads this before importing CTranslate2, so it does not infer its behavior
+# from DLL names, sizes, installed drivers, or available GPUs.
+_backend_marker = (
+    Path(tempfile.mkdtemp(prefix='whisp-carrier-build-'))
+    / 'whisp-carrier-backend.txt'
+)
+_backend_marker.write_text(GPU_BACKEND + '\n', encoding='ascii')
+
+datas = [(str(_backend_marker), '.')]
 datas += collect_data_files('faster_whisper')
 datas += collect_data_files('ctranslate2')
 datas += collect_data_files('tokenizers')
@@ -144,8 +204,6 @@ for _src, _name in TEN_VAD_LICENCES:
 # the configure banner of the actual binary is inspected, and a GPL or non-free
 # build aborts the build outright.
 # ---------------------------------------------------------------------------
-import os
-import shutil
 import hashlib
 import subprocess
 
@@ -250,17 +308,19 @@ if not FFMPEG_LICENSE_SRC.is_file():
 # ---------------------------------------------------------------------------
 # Preserve a live config file across rebuilds.
 #
-# COLLECT deletes dist/whisp-carrier before repopulating it, which takes
-# whisp-carrier.yaml with it. That file is not a build artifact: it is the
-# user's settings, and on this machine it is what points Amatsukaze at the
-# external VAD (worth 2.8pt of CER). Losing it silently means the next run
-# quietly falls back to the built-in VAD path, which is exactly the kind of
-# regression that does not announce itself.
+# COLLECT deletes dist/<DIST_NAME> before repopulating it, which takes
+# whisp-carrier.yaml with it. DIST_NAME is whisp-carrier for CUDA and
+# whisp-carrier-amd for ROCm; both packages keep the same yaml filename.
+# That file is not a build artifact: it is the user's settings, and on this
+# machine it is what points Amatsukaze at the external VAD (worth 2.8pt of
+# CER). Losing it silently means the next run quietly falls back to the
+# built-in VAD path, which is exactly the kind of regression that does not
+# announce itself.
 #
 # Read before COLLECT runs, written back after. Only whisp-carrier.yaml is
 # treated this way; the .example is a build artifact and gets overwritten.
 # ---------------------------------------------------------------------------
-LIVE_CONFIG_PATH = Path(DISTPATH) / 'whisp-carrier' / 'whisp-carrier.yaml'
+LIVE_CONFIG_PATH = Path(DISTPATH) / DIST_NAME / 'whisp-carrier.yaml'
 LIVE_CONFIG_DATA = None
 if LIVE_CONFIG_PATH.is_file():
     LIVE_CONFIG_DATA = LIVE_CONFIG_PATH.read_bytes()
@@ -412,38 +472,103 @@ binaries = []
 if SLIM:
     excludes += ['torch', 'torchaudio', 'silero_vad']
 
-    _CUDA_KEEP = ('cublas64_', 'cublaslt64_', 'cudnn', 'cudart64_',
-                  'nvrtc64_', 'nvjitlink_')
-    try:
-        import torch as _torch_probe
-        _torch_lib = Path(_torch_probe.__file__).parent / 'lib'
-    except Exception as exc:
-        raise SystemExit(
-            f'[spec] the slim build needs to read the CUDA libraries out '
-            f'of the installed torch, but importing torch failed: {exc}\n'
-            'Either install torch in the build environment, or install the '
-            'nvidia-cublas-cu12 and nvidia-cudnn-cu12 wheels and point '
-            '_torch_lib at them.'
-        )
+    if ROCM:
+        # hipBLAS is MIT and is redistributed in the AMD package. The HIP
+        # runtime (amdhip64_7.dll) comes from the user's Adrenalin driver and is
+        # intentionally not copied. Do not accept the ROCm 7.1 libhipblas.dll
+        # alias: renaming it for a wheel built against 7.2 is ABI-unverified.
+        _hipblas_candidates = []
+        _hipblas_override = os.environ.get('WHISP_CARRIER_HIPBLAS')
+        if _hipblas_override:
+            _override_path = Path(_hipblas_override)
+            _hipblas_candidates.append(
+                _override_path / 'hipblas.dll' if _override_path.is_dir()
+                else _override_path
+            )
+        _which_hipblas = shutil.which('hipblas.dll')
+        if _which_hipblas:
+            _hipblas_candidates.append(Path(_which_hipblas))
+        _rocm_root = Path(r'C:\Program Files\AMD\ROCm')
+        if _rocm_root.is_dir():
+            _hipblas_candidates.extend(
+                version / 'bin' / 'hipblas.dll'
+                for version in sorted(_rocm_root.iterdir(), reverse=True)
+                if version.is_dir()
+            )
+        _hipblas = next((p.resolve() for p in _hipblas_candidates
+                         if p.is_file() and p.name.lower() == 'hipblas.dll'), None)
+        if _hipblas is None:
+            raise SystemExit(
+                '[spec] ROCm build detected, but hipblas.dll was not found. '
+                'Install a matching HIP SDK or set WHISP_CARRIER_HIPBLAS to '
+                'the exact hipblas.dll (or its directory). libhipblas.dll is '
+                'not accepted because its ABI compatibility is unverified.'
+            )
+        _rocm_bin = _hipblas.parent
+        _ROCM_DLLS = ('hipblas.dll', 'rocblas.dll', 'rocsolver.dll',
+                      'libhipblaslt.dll')
+        _missing_rocm = [name for name in _ROCM_DLLS
+                         if not (_rocm_bin / name).is_file()]
+        if _missing_rocm:
+            raise SystemExit(
+                f'[spec] incomplete ROCm library directory {_rocm_bin}; '
+                f'missing {", ".join(_missing_rocm)}. Use the matching AMD '
+                'rocm_sdk_libraries_custom wheel or HIP SDK, not a lone DLL.'
+            )
+        binaries.extend((str(_rocm_bin / name), '.') for name in _ROCM_DLLS)
 
-    _kept_mb = _dropped_mb = 0
-    for _dll in sorted(_torch_lib.glob('*.dll')):
-        _name = _dll.name.lower()
-        _mb = _dll.stat().st_size / (1024 * 1024)
-        if _name.startswith(_CUDA_KEEP) and '.alt.' not in _name:
-            binaries.append((str(_dll), '.'))
-            _kept_mb += _mb
-        else:
-            _dropped_mb += _mb
-    if not binaries:
-        raise SystemExit(
-            f'[spec] no CUDA libraries matched under {_torch_lib}. CTranslate2 '
-            'needs cuBLAS and cuDNN at runtime, and shipping without them '
-            'would produce an exe that fails on the first encoder call. Check '
-            'the layout and update _CUDA_KEEP.'
-        )
-    print(f'[spec] SLIM: keeping {len(binaries)} CUDA libraries '
-          f'({_kept_mb:.0f} MB), dropping {_dropped_mb:.0f} MB of torch')
+        # rocBLAS and hipBLASLt load architecture-specific kernels from these
+        # relative directories at runtime. Binary dependency scanning cannot
+        # discover data files, so preserve both complete trees explicitly.
+        _kernel_count = 0
+        for _library_name in ('rocblas', 'hipblaslt'):
+            _library_root = _rocm_bin / _library_name / 'library'
+            if not _library_root.is_dir():
+                raise SystemExit(
+                    f'[spec] missing ROCm kernel directory: {_library_root}'
+                )
+            for _kernel in _library_root.rglob('*'):
+                if not _kernel.is_file():
+                    continue
+                _relative = _kernel.relative_to(_rocm_bin)
+                datas.append((str(_kernel), str(_relative.parent)))
+                _kernel_count += 1
+        print(f'[spec] ROCm: bundling {len(_ROCM_DLLS)} libraries and '
+              f'{_kernel_count} kernel data files from {_rocm_bin}; '
+              'amdhip64_7.dll will be supplied by the AMD driver')
+    else:
+        _CUDA_KEEP = ('cublas64_', 'cublaslt64_', 'cudnn', 'cudart64_',
+                      'nvrtc64_', 'nvjitlink_')
+        try:
+            import torch as _torch_probe
+            _torch_lib = Path(_torch_probe.__file__).parent / 'lib'
+        except Exception as exc:
+            raise SystemExit(
+                f'[spec] the slim build needs to read the CUDA libraries out '
+                f'of the installed torch, but importing torch failed: {exc}\n'
+                'Either install torch in the build environment, or install the '
+                'nvidia-cublas-cu12 and nvidia-cudnn-cu12 wheels and point '
+                '_torch_lib at them.'
+            )
+
+        _kept_mb = _dropped_mb = 0
+        for _dll in sorted(_torch_lib.glob('*.dll')):
+            _name = _dll.name.lower()
+            _mb = _dll.stat().st_size / (1024 * 1024)
+            if _name.startswith(_CUDA_KEEP) and '.alt.' not in _name:
+                binaries.append((str(_dll), '.'))
+                _kept_mb += _mb
+            else:
+                _dropped_mb += _mb
+        if not binaries:
+            raise SystemExit(
+                f'[spec] no CUDA libraries matched under {_torch_lib}. CTranslate2 '
+                'needs cuBLAS and cuDNN at runtime, and shipping without them '
+                'would produce an exe that fails on the first encoder call. Check '
+                'the layout and update _CUDA_KEEP.'
+            )
+        print(f'[spec] SLIM: keeping {len(binaries)} CUDA libraries '
+              f'({_kept_mb:.0f} MB), dropping {_dropped_mb:.0f} MB of torch')
 
 a = Analysis(
     ['whisp_carrier.py'],
@@ -463,7 +588,7 @@ a = Analysis(
     noarchive=False,
 )
 
-if SLIM:
+if SLIM and not ROCM:
     # Excluding the torch *module* does not stop PyInstaller from collecting
     # torch's DLLs: it walks the binary dependency graph of the libraries added
     # above and re-collects some of them under their original torch/lib path.
@@ -495,7 +620,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='whisp-carrier',
+    name=DIST_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -516,7 +641,7 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='whisp-carrier',
+    name=DIST_NAME,
 )
 
 # Ship the config sample next to the exe rather than inside _internal, because
@@ -525,7 +650,7 @@ coll = COLLECT(
 # up under _internal in onedir mode, so this has to be a post-COLLECT copy.
 _sample = Path(SPECPATH) / 'whisp-carrier.yaml.example'
 if _sample.is_file():
-    _target = Path(DISTPATH) / 'whisp-carrier' / _sample.name
+    _target = Path(DISTPATH) / DIST_NAME / _sample.name
     _target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(_sample, _target)
     print(f'[spec] copied config sample to: {_target}')
@@ -533,7 +658,7 @@ if _sample.is_file():
 # Licence paperwork, for the same reason and by the same route. LGPL requires
 # ffmpeg's licence text to accompany the binary, and a reader looking for it
 # will look beside the exe, not inside _internal.
-_dist_root = Path(DISTPATH) / 'whisp-carrier'
+_dist_root = Path(DISTPATH) / DIST_NAME
 _dist_root.mkdir(parents=True, exist_ok=True)
 
 if FFMPEG_LICENSE_SRC.is_file():
@@ -559,6 +684,20 @@ for _name in ('LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md'):
         print(f'[spec] copied {_name} to: {_dist_root / _name}')
     else:
         print(f'[spec] WARNING: {_name} not found ({_src})')
+
+if ROCM:
+    for _rocm_licence_name in (
+        'LICENSE.hipBLAS.txt',
+        'LICENSE.hipBLASLt.txt',
+        'LICENSE.rocBLAS.txt',
+        'LICENSE.rocSOLVER.txt',
+    ):
+        _rocm_licence = Path(SPECPATH) / _rocm_licence_name
+        if not _rocm_licence.is_file():
+            raise SystemExit(f'[spec] missing ROCm licence: {_rocm_licence}')
+        shutil.copy2(_rocm_licence, _dist_root / _rocm_licence.name)
+        print(f'[spec] copied ROCm licence to: '
+              f'{_dist_root / _rocm_licence.name}')
 
 # Put the user's settings back (see LIVE_CONFIG_PATH above).
 if LIVE_CONFIG_DATA is not None:

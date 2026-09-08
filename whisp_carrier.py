@@ -36,6 +36,36 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 # the startup banner so a support log says which machine this happened on.
 CUDA_ENV_DROPPED: List[str] = []
 
+# The ROCm build is distributed separately from the CUDA build. The spec writes
+# the explicitly requested backend into PyInstaller's _internal directory, so
+# runtime behavior never has to infer intent from whichever DLL happens to be
+# present. This must be known before importing faster_whisper/ctranslate2:
+# unlike cuBLAS, hipBLAS is a direct dependency of ctranslate2.dll.
+_frozen_root_value = getattr(sys, "_MEIPASS", None) if getattr(sys, "frozen", False) else None
+_FROZEN_ROOT = Path(_frozen_root_value) if _frozen_root_value else None
+_BACKEND_MARKER = _FROZEN_ROOT / "whisp-carrier-backend.txt" if _FROZEN_ROOT else None
+if _BACKEND_MARKER is not None:
+    if not _BACKEND_MARKER.is_file():
+        raise RuntimeError(
+            "The frozen package is missing whisp-carrier-backend.txt; "
+            "rebuild it with whisp_carrier.spec."
+        )
+    BUNDLED_BACKEND = _BACKEND_MARKER.read_text(encoding="ascii").strip().lower()
+    if BUNDLED_BACKEND not in ("cuda", "rocm"):
+        raise RuntimeError(
+            f"Invalid frozen backend marker: {BUNDLED_BACKEND!r}"
+        )
+else:
+    BUNDLED_BACKEND = None
+BUNDLED_ROCM = BUNDLED_BACKEND == "rocm"
+_BUNDLED_GPU_HANDLES: List[object] = []
+BUNDLED_HIP_PRELOAD = (
+    "libhipblaslt.dll",
+    "rocblas.dll",
+    "rocsolver.dll",
+    "hipblas.dll",
+)
+
 # The CUDA libraries CTranslate2 resolves by name at first use, in dependency
 # order (cublas imports cublasLt). Pinned by absolute path rather than found by
 # search: see preload_bundled_cuda().
@@ -49,6 +79,54 @@ BUNDLED_CUDA_PRELOAD = ("cublasLt64_12.dll", "cublas64_12.dll")
 #   'preload'   pinning only, CUDA_PATH left in place
 #   'off'       neither, i.e. the 0.9.1 behaviour
 _CUDA_FIX = os.environ.get("WHISP_CARRIER_CUDA_FIX", "").strip().lower()
+
+
+def _preload_bundled_hip() -> List[str]:
+    r"""Load the ROCm runtime and bundled hipBLAS before importing CTranslate2.
+
+    The ROCm wheel links directly to both DLLs. amdhip64_7.dll is supplied by
+    the AMD display driver and is deliberately not redistributed; hipblas.dll
+    is copied into the AMD build by whisp_carrier.spec. Loading the latter by
+    absolute path prevents an installed HIP SDK from silently overriding the
+    version that was packaged and tested.
+    """
+    if os.name != "nt" or not BUNDLED_ROCM or _FROZEN_ROOT is None:
+        return []
+
+    # Keep the directory in the process search path for lazy HIP loads without
+    # retaining an os.add_dll_directory cookie. On the tested ROCm runtime that
+    # cookie can block model destruction after "All done"; SetDllDirectoryW
+    # provides the same process-lifetime search path without a Python object
+    # whose cleanup can interact with CTranslate2's DLL teardown.
+    if not ctypes.windll.kernel32.SetDllDirectoryW(str(_FROZEN_ROOT)):
+        raise ctypes.WinError()
+
+    loaded: List[str] = []
+    try:
+        hip_runtime = ctypes.WinDLL("amdhip64_7.dll")
+        _BUNDLED_GPU_HANDLES.append(hip_runtime)
+        loaded.append("amdhip64_7.dll")
+    except OSError as exc:
+        raise RuntimeError(
+            "The AMD ROCm build needs amdhip64_7.dll from a current AMD "
+            "Adrenalin driver. Update the driver and try again."
+        ) from exc
+
+    for name in BUNDLED_HIP_PRELOAD:
+        path = _FROZEN_ROOT / name
+        try:
+            library = ctypes.WinDLL(str(path))
+            _BUNDLED_GPU_HANDLES.append(library)
+            loaded.append(name)
+        except OSError as exc:
+            raise RuntimeError(
+                f"The bundled ROCm library {name} could not be loaded. The AMD "
+                "driver and the packaged ROCm runtime may be incompatible."
+            ) from exc
+    return loaded
+
+
+BUNDLED_HIP_PRELOADED = _preload_bundled_hip()
 
 
 def _use_bundled_cuda() -> None:
@@ -74,7 +152,7 @@ def _use_bundled_cuda() -> None:
     Frozen builds only. From source there is no bundled copy to prefer, and
     torch registers its own directory on import.
     """
-    if os.name != "nt" or not getattr(sys, "frozen", False):
+    if os.name != "nt" or not getattr(sys, "frozen", False) or BUNDLED_ROCM:
         return
     if _CUDA_FIX in ("off", "preload"):
         return
@@ -128,7 +206,7 @@ def preload_bundled_cuda() -> List[str]:
     CTranslate2 does -- confirmed in the field, where putting _internal on PATH
     was enough to make 0.9.1 work.
     """
-    if os.name != "nt" or not getattr(sys, "frozen", False):
+    if os.name != "nt" or not getattr(sys, "frozen", False) or BUNDLED_ROCM:
         return []
     if _CUDA_FIX == "off":
         return []
@@ -289,8 +367,8 @@ def resolve_vad_threshold(method: str) -> float:
     return VAD_THRESHOLD_DEFAULTS[family]
 # Device reporting, and the source of the `--device auto` decision.
 #
-# torch is asked first because the script version has it and it answers all
-# three questions, including the GPU name. It is not required though: inference
+# torch is asked first because the script version has it and it can report the
+# GPU name. It is not required though: inference
 # runs on CTranslate2 and the default VAD is a native library reached with
 # ctypes, so nothing on the normal path imports torch. The exe therefore does
 # not bundle it -- torch and the CUDA kernels it carries were 4.3 GB of a 4.7 GB
@@ -298,8 +376,9 @@ def resolve_vad_threshold(method: str) -> float:
 # fifteen references.
 #
 # ctranslate2 answers the one question that changes behaviour ("is there a usable
-# CUDA device"), so falling back to it keeps `--device auto` correct without
-# torch. The GPU name is cosmetic and is reported as unknown instead.
+# GPU device"). Its public API is still named get_cuda_device_count() in a ROCm
+# build. Always ask it when torch reports no CUDA device: Windows torch can be
+# installed and importable on an AMD machine while CTranslate2 uses HIP.
 TORCH_VERSION = ""
 CUDA_AVAILABLE = False
 CUDA_DEVICE_NAME = "N/A"
@@ -309,13 +388,60 @@ try:
     CUDA_AVAILABLE = torch.cuda.is_available()
     CUDA_DEVICE_NAME = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "N/A"
 except Exception:
+    pass
+
+if not CUDA_AVAILABLE:
     try:
         import ctranslate2
         CUDA_AVAILABLE = ctranslate2.get_cuda_device_count() > 0
         if CUDA_AVAILABLE:
-            CUDA_DEVICE_NAME = "(name unavailable without torch)"
+            CUDA_DEVICE_NAME = "(name unavailable through CTranslate2)"
     except Exception:
         pass
+
+
+def _ctranslate2_backend_for(platform_name: str) -> str:
+    """Return the GPU backend used by the installed CTranslate2 package."""
+    if platform_name == "posix" and sys.platform.startswith("linux"):
+        try:
+            import ctranslate2
+            from whisp_backend import ctranslate2_linux_is_rocm
+
+            package_dir = Path(ctranslate2.__file__).parent
+            return "rocm" if ctranslate2_linux_is_rocm(package_dir) else "cuda"
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not inspect the CTranslate2 ELF dependencies: {exc}"
+            ) from exc
+    if platform_name != "nt":
+        return "cuda"
+
+    dll = None
+    try:
+        import ctranslate2
+        from whisp_backend import ctranslate2_is_rocm
+
+        dll = Path(ctranslate2.__file__).parent / "ctranslate2.dll"
+        if not dll.is_file():
+            raise FileNotFoundError(f"CTranslate2 DLL not found: {dll}")
+        # The ROCm DLL imports the HIP runtime directly, so its import table
+        # identifies the backend of the installed CTranslate2 wheel.
+        if ctranslate2_is_rocm(dll):
+            return "rocm"
+        return "cuda"
+    except Exception as exc:
+        where = dll if dll is not None else "ctranslate2.dll"
+        raise RuntimeError(
+            "Could not inspect the CTranslate2 DLL to decide CUDA vs ROCm "
+            f"({where}): {exc}"
+        ) from exc
+
+
+def ctranslate2_backend() -> str:
+    """Prefer the explicit backend recorded in a frozen package."""
+    if BUNDLED_BACKEND is not None:
+        return BUNDLED_BACKEND
+    return _ctranslate2_backend_for(os.name)
 
 
 def runtime_banner() -> str:
@@ -326,9 +452,46 @@ def runtime_banner() -> str:
     """
     try:
         import ctranslate2
-        return f"ctranslate2 {ctranslate2.__version__}"
+        version = ctranslate2.__version__
     except Exception:
-        return "ctranslate2 (version unknown)"
+        version = None
+    try:
+        backend = ctranslate2_backend()
+    except Exception:
+        backend = "unknown"
+    if version is None:
+        return f"ctranslate2 (version unknown) | backend={backend}"
+    return f"ctranslate2 {version} | backend={backend}"
+
+
+def _finish_rocm_process(status: int) -> None:
+    """Bypass a Windows ROCm teardown hang after all output is durable.
+
+    Call only after output files are closed and inference has finished.
+    os._exit() still enters Windows DLL process-detach handlers and can hang
+    after ROCm inference. TerminateProcess on our own process bypasses those
+    handlers; the OS reclaims its resources and preserves the supplied exit
+    code. Non-ROCm builds retain normal Python cleanup.
+    """
+    if os.name != "nt":
+        return
+    try:
+        if ctranslate2_backend() != "rocm":
+            return
+    except Exception:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            stream.flush()
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    if not kernel32.TerminateProcess(kernel32.GetCurrentProcess(), status):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 # ─────────────────────────────────────────────
@@ -934,7 +1097,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reconvert", action="store_true",
                    help="Convert the model again even if a converted copy is cached.")
     p.add_argument("--device", "-d", default="auto",
-                   help="Device: cuda / cpu / auto.")
+                   help="Device: cuda / cpu / auto. ROCm builds also use 'cuda'.")
     p.add_argument("--compute_type", "-ct",
                    default="default",
                    choices=["default", "auto", "int8", "int8_float16", "int8_float32",
@@ -1271,6 +1434,8 @@ def main() -> None:
         # the bundled libraries are used instead of it.
         print(f"[CUDA] ignoring {' / '.join(CUDA_ENV_DROPPED)}; "
               f"using the bundled CUDA libraries", flush=True)
+    if BUNDLED_HIP_PRELOADED and args.verbose:
+        print(f"[ROCm] loaded {', '.join(BUNDLED_HIP_PRELOADED)}", flush=True)
 
     # Replacing the built-in VAD model has to happen before anything runs it,
     # because faster-whisper caches the instance on first use.
@@ -1419,9 +1584,11 @@ def main() -> None:
         )
         for f in failures:
             print(f"  {console_safe(str(f))}", file=sys.stderr, flush=True)
+        _finish_rocm_process(1)
         sys.exit(1)
 
     print("\n[whisp-carrier] All done.", flush=True)
+    _finish_rocm_process(0)
 
 
 if __name__ == "__main__":

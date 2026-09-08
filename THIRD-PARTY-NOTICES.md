@@ -9,6 +9,13 @@ NVIDIA CUDA libraries CTranslate2 loads). Running from source pulls the same
 Python packages from your environment and additionally enables model conversion;
 only the bundled `ffmpeg.exe` is specific to the build.
 
+The spec also produces a separate AMD ROCm build as
+`dist-amd/whisp-carrier-amd/` when the official ROCm CTranslate2 wheel is
+installed. The two packages never mix CTranslate2 backends. The AMD build adds
+the hipBLAS/rocBLAS/rocSOLVER/hipBLASLt runtime, architecture kernel data and
+their four `LICENSE.*.txt` notices; `amdhip64_7.dll` is supplied by the user's
+AMD driver and is not redistributed.
+
 **PyTorch is no longer bundled (since 0.9.1).** Inference runs on CTranslate2 and
 the default VAD is a native library called through `ctypes`, so nothing on the
 normal path imported it; it accounted for 4.27 GB of the previous 4.78 GB build.
@@ -73,6 +80,7 @@ be added to the DLL search path was added by `torch/__init__.py`.
 | cuDNN 9 (`cudnn*64_9.dll`) | NVIDIA, via the `torch` wheel and `ctranslate2` | [NVIDIA cuDNN licence](https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html) |
 | Intel OpenMP (`libiomp5md.dll`) | Intel, via `ctranslate2` | [Intel Simplified Software License](https://www.intel.com/content/www/us/en/developer/articles/license/end-user-license-agreement.html) |
 | CTranslate2 (`ctranslate2.dll`) | [OpenNMT/CTranslate2](https://github.com/OpenNMT/CTranslate2) | MIT |
+| hipBLAS / rocBLAS / rocSOLVER / hipBLASLt (AMD build only) | AMD ROCm 7.2.1 wheels / [ROCm libraries](https://github.com/ROCm/rocm-libraries) | MIT/BSD plus bundled third-party notices; full texts ship as four `LICENSE.*.txt` files |
 | **PyInstaller bootloader** (compiled into `whisp-carrier.exe`) | [PyInstaller](https://github.com/pyinstaller/pyinstaller) | **GPL-2.0-or-later with the bootloader exception** — see section 5 |
 | **libsndfile** (`_soundfile_data/libsndfile_x64.dll`) | [libsndfile](https://github.com/libsndfile/libsndfile), via `soundfile` | **LGPL-2.1-or-later** — see section 5 |
 | Microsoft Visual C++ runtime, OpenSSL (`libssl-3.dll`, `libcrypto-3.dll`), SQLite, expat, libffi | CPython 3.11 redistributables | Respective upstream licences (MS runtime redistribution terms, Apache-2.0, public domain, MIT) |

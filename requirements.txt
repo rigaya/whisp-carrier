@@ -2,6 +2,10 @@ torch==2.8.0
 torchaudio==2.8.0
 # 1.2.1 以降は内蔵VADが silero v6 になる。README/HANDOVER はこれを前提にしている。
 faster-whisper>=1.2.1
+# Windowsスクリプト版でCTranslate2 DLLのCUDA/ROCmバックエンドを判定するために使用。
+pefile>=2023.2.7; platform_system == "Windows"
+# Linuxスクリプト版でCTranslate2のELF依存先を調べるために使用。
+pyelftools>=0.31; platform_system == "Linux"
 # transformers 形式のモデル（-m anime-whisper 等）を CTranslate2 に変換するときだけ
 # 必要。変換は初回のみで、変換済みモデルを使う場合は無くても動く。
 # ctranslate2 4.8 系のコンバータは from_pretrained に dtype= を渡すため 4.56 以上。

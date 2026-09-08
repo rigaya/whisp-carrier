@@ -5768,3 +5768,75 @@ guard = whisp_models.word_timestamp_guard(
 **前回までの内容（TEN VAD を既定にする一連の測定）は[現状](STATUS.md#現状)と
 [測定結果](#測定結果)に移した。** 15本で silero に 15勝0敗、
 実運用と測定が同一素材で一致、という到達点はそこで読める。
+
+---
+
+## AMD ROCm 事前確認（2026-08-30）
+
+公式 CTranslate2 v4.8.1 の `rocm-python-wheels-Windows.zip`（137,399,104 bytes）を
+GitHub Releases から一時領域へ取得し、cp312 wheel を展開して確認した。取得物と
+添付の調査スクリプトはリポジトリへコピーしておらず、Git 管理外。
+
+| 確認項目 | 結果 |
+|---|---|
+| wheel 内 `ctranslate2.dll` | 290,646,528 bytes |
+| `ctranslate2.dll` の直接依存 | `hipblas.dll`, `amdhip64_7.dll`（ほかは VC runtime / Intel OpenMP / Windows） |
+| `hipblas.dll` の推移依存 | `rocblas.dll`, `rocsolver.dll`, `libhipblaslt.dll` と2系統のカーネル data tree |
+| この機の `amdhip64_7.dll` | `C:\Windows\System32\amdhip64_7.dll`、`LoadLibrary` 成功 |
+| HIP/BLAS ランタイム | AMD 公式 `rocm_sdk_libraries_custom` 7.2.1 wheel を隔離 venv に導入 |
+| tiny float16 | 9.98秒、1.9秒（5.3x）、単語タイムスタンプ42個 |
+| large-v3 float16（通常） | 119.71秒、90.92秒（1.32x）、単語タイムスタンプ492個 |
+| large-v3 float16（batched=8） | 119.71秒、4.61秒（25.97x）、単語タイムスタンプ492個 |
+| 実 AAC / large-v3 float16（batched=8） | 1464.7秒、TEN VAD 5.1秒、推論44.1秒、全体49.045秒、exit 0 |
+
+配布設計は CUDA / ROCm を別パッケージにした。両 wheel の
+`ctranslate2.dll` は同名で置換関係にあり、単一 `_internal` に安全に同居できない。
+AMD 版は `whisp-carrier-amd.exe`、CUDA 版は従来どおり `whisp-carrier.exe`。
+AMD 版には hipBLAS とライセンス通知を入れ、`amdhip64_7.dll` はドライバから読む。
+
+短尺 large-v3 の転写文は合成した原文と一致。長尺 batched は内容語を保ち、原文との差は
+各反復の読点1個（12 / 660字、約1.8%）だった。ただしこれは合成音声の自己一致であり、
+CUDA 版との CER 比較ではない。通常推論は速度条件を満たさず、batched は十分満たすため、
+AMD 配布版だけ batched を既定にする判断だった。未確定なのは既存 eval 素材での CUDA 版との CER。
+
+追記（2026-09-05）：実音声 `F:\temp\test.aac` / large-v3-turbo の比較を受け、
+AMD も通常推論を既定に変更した。CUDA 通常推論315字幕に対しAMD通常推論も315字幕、
+本文313件が完全一致し、推論は43.6秒。旧AMDバッチ推論は65字幕まで結合されていた。
+`without_timestamps=False` を明示するとバッチ推論も301字幕まで改善したが、
+CUDA の結果に近い通常推論を採用。バッチ推論は `--batched` 指定時のみ使う。
+これは単一素材での出力比較であり、正解字幕に対する CER 評価ではない。
+
+同日の終了処理修正：通常推論は `All done.` とSRT出力後もプロセスが残った。
+既存の `os._exit()` でも回避できず、出力ファイルのcloseと標準出力のflush後に
+Windows `TerminateProcess(GetCurrentProcess(), status)` を呼ぶ形へ変更した。
+これはDLLのprocess-detach処理を避ける対策（個々のDLL内の停止箇所までは未特定）。
+再ビルドしたAMD exeで同じAACを無指定の通常推論で処理するとexit 0で終了し、
+SRTのSHA-256は変更前と一致（`2b8d09e63723fda12be5832344bfc017cfafe0493cd63d1898a1b4e01ef9ab0c`）。
+無効なAAC入力もexit 1で終了し、プロセスは残らなかった。
+
+最終入力に指定された `X:\temp\sample\_test.aac` は実在せず、同名相当として見つかった
+`X:\temp\sample_test.aac`（46,823,914 bytes）を使用した。TEN VAD の39領域は batched
+用に30秒以下の64 clipへ分割され、JSONは64セグメント、最終セグメントは
+1439.900–1463.420秒。SRT/JSONは `X:\temp\whisp-carrier-amd-final-test-v4` に生成した。
+
+この実素材で batched API の `clip_timestamps` が通常推論と異なる型を要求すること、
+30秒超の辞書 clip は残りを自動処理せず切り捨てることが判明した。辞書配列への変換と
+30秒分割を実装し、元の39領域を64 clipとして全範囲処理した。また Windows ROCm は
+実推論後のモデル破棄で `All done` の後に停止するため、出力を閉じて flush した後だけ
+終了コードを保ったまま明示終了する。CUDA / CPU の終了経路は変更しない。
+
+### CUDA 配布版の回帰ビルド（2026-09-05）
+
+`WHISP_CARRIER_BACKEND` を未指定にし、既定値 `cuda` でPyInstallerのslim版を
+`dist-slim/whisp-carrier` へビルドした。ビルド環境はPython 3.12.10、標準
+CTranslate2 4.8.1、PyTorch 2.8.0+cu128。ホストにはCUDA Toolkit 12.9が入っているが、
+配布物はPyTorchの `torch/lib` から13個、1,870 MBのCUDA DLLを収集する。
+
+完成物は755ファイル、2,327,776,110 bytes。backend markerは `cuda`、ROCm DLLは
+混入していない。実行時はPATHを `C:\Windows\System32;C:\Windows` のみにし、
+`CUDA_PATH` も除去した状態で `--version` / `--checkcuda` がともにexit 0、RTX 2070を
+1台認識した。したがってインストール済みToolkitではなく同梱CUDA DLLで起動している。
+
+最終入力をローカル `F:\temp\sample_test.aac` へコピーしてlarge-v3 / float16 /
+CUDA版既定の非batchedで全編処理した。1464.7秒に対してTEN VAD 39領域、推論95.4秒、
+全体100.259秒、JSON/SRT 366セグメント、最終時刻1463.420秒、exit 0。

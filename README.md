@@ -2,7 +2,7 @@
 
 **日本語** | [English](README_en.md)
 
-RTX 5090 (Blackwell / sm_120) にネイティブ対応した faster-whisper CLIツール。  
+NVIDIA CUDA と AMD ROCm に対応する faster-whisper CLIツール。
 Faster-Whisper-XXL の代替として、全てオープンソースのコンポーネントで構築。
 
 **このドキュメントは配布している exe 版のマニュアルです。**
@@ -20,6 +20,8 @@ exe でできないことは[exe版とスクリプト版の違い](#exe版とス
 
 - **RTX 5090 ネイティブ動作** — CTranslate2 + CUDA 12.8 / sm_120 を float16 のまま。
   互換モード落ちも `-ct float32` の指定も不要
+- **AMD ROCm 版** — CTranslate2 の Windows ROCm ビルドを使い、RDNA3 / RDNA3.5 /
+  RDNA4 を float16 で動かすための別パッケージ。対応gfxと実機確認状況は下記
 - **Amatsukaze 対応** — faster-whisper-xxl.exe と同じCLIインターフェース
 - **TEN VAD が既定**（Apache-2.0）— silero より台詞の取りこぼしが少なく、
   24分もの9本で全文CER 19.0% → **15.5%**、子供向け4本で 30.8% → **21.6%** でした
@@ -39,8 +41,41 @@ exe でできないことは[exe版とスクリプト版の違い](#exe版とス
 ## 導入
 
 - Windows 10/11 (x64)
-- NVIDIA RTX GPU + CUDA 12.8 以上のドライバ
-- **Python も CUDA Toolkit も ffmpeg も不要です**（ffmpeg は同梱、LGPL版）
+- NVIDIA 版: NVIDIA RTX GPU + CUDA 12.8 以上のドライバ
+- AMD 版: Windows 11、対応 Radeon GPU、HIP 7 対応の最新ドライバ
+- **Python も CUDA/HIP SDK も ffmpeg も不要です**（ffmpeg は同梱、LGPL版）
+
+### AMD版の対象GPU
+
+AMDパッケージが同梱するrocBLAS / hipBLASLtカーネルの対象は次のとおりです。
+ここでいう「対象」は必要なgfxカーネルを配布物に収録しているという意味で、すべての
+GPUを実機検証済みという意味ではありません。ドライバが示すgfx名が表にあることが条件です。
+
+| GPU世代 | 同梱gfxターゲット | 主な製品群 | 確認状況 |
+|---|---|---|---|
+| RDNA3 | `gfx1100`, `gfx1101`, `gfx1102` | Radeon RX 7000系 | **RX 7900 XT (`gfx1100`) で実機確認済み** |
+| RDNA3.5 | `gfx1150`, `gfx1151` | Ryzen AI 300 / Ryzen AI Max系の対応内蔵Radeon | 未確認 |
+| RDNA4 | `gfx1200`, `gfx1201` | Radeon RX 9000系 | RX 9060 XTで実機確認済み |
+
+`gfx103x` のRDNA2以前、および表にないgfxはこのAMDパッケージの対象外です。実際に
+`gfx1036` の内蔵GPUはROCmから列挙されても、このCTranslate2/カーネル構成では実行できません。
+GPUの商品名だけでは派生チップを判別しきれないため、未確認GPUでは `rocminfo` のgfx名と
+上表を照合してください。
+
+動作確認済みの環境:
+
+- Windows exe版: CUDA RTX 2070 / RTX 4080、AMD RX 7900 XT / RX 9060 XT
+- Linux venv版: CUDA RTX 2070 / RTX 4080（WSL2）、AMD RX 9060 XT
+
+NVIDIA 版と AMD 版は**別パッケージ**です。両方を同じ PC に展開できますが、同じ
+フォルダーへ上書きせず、`whisp-carrier/` と `whisp-carrier-amd/` のように分けてください。
+両バックエンドの `ctranslate2.dll` は同名で差し替え関係にあるため、単一パッケージには
+同居させません。AMD 版の exe 名は `whisp-carrier-amd.exe` です。
+
+> AMD 版も通常推論が既定です。
+> バッチ推論は `--batched` を指定したときだけ有効になります。
+> `--realign` と `--vad_device cuda` は Windows の PyTorch 経路になるため AMD 版では使わず、
+> 既定の TEN VAD（CPU）のまま使用してください。
 
 > **GPU が認識できないとき、エラーで止まらずに CPU で動き続けます。**
 > ドライバが CUDA 12.8 未満だったり NVIDIA GPU が無い環境では、
@@ -51,11 +86,12 @@ exe でできないことは[exe版とスクリプト版の違い](#exe版とス
 > 判定は起動時に出る `device=` の行です。**`device=cuda` になっていれば GPU を使っています。**
 >
 > ```
-> ctranslate2 4.8.1 | device=cuda | compute=float16     ← 正常
-> ctranslate2 4.8.1 | device=cpu | compute=int8         ← GPU を使えていない
+> ctranslate2 4.8.1 | backend=cuda | device=cuda | compute=float16  ← NVIDIA 正常
+> ctranslate2 4.8.1 | backend=rocm | device=cuda | compute=float16  ← AMD 正常
+> ctranslate2 4.8.1 | backend=rocm | device=cpu | compute=int8      ← GPU を使えていない
 > ```
 >
-> `whisp-carrier.exe --checkcuda` でも確認できます（`1` 以上なら GPU が見えています。`0` なら見えていません）。
+> 各パッケージの exe に `--checkcuda` を付けても確認できます（`1` 以上なら GPU が見えています。`0` なら見えていません）。
 
 > **CUDA Toolkit が入っている環境でも、同梱の CUDA ライブラリを使います**（0.9.2 から）。
 > 起動時に `[CUDA] ignoring CUDA_PATH; using the bundled CUDA libraries` と出るのは
@@ -67,7 +103,8 @@ exe でできないことは[exe版とスクリプト版の違い](#exe版とス
 > `Library cublas64_12.dll is not found or cannot be loaded` で停止しました。
 > **0.9.1 を使っていてこのエラーが出た場合は 0.9.2 に更新してください。**
 
-アーカイブを展開して、`whisp-carrier.exe` を好きな場所に置くだけです。
+アーカイブを展開して、NVIDIA 版は `whisp-carrier.exe`、AMD 版は
+`whisp-carrier-amd.exe` を使います。以下の例の exe 名は NVIDIA 版表記です。
 Amatsukaze から呼ぶ場合は[Amatsukaze との連携](#amatsukaze-との連携)へ。
 
 **0.9.1 で展開後のサイズが 4.78GB → 2.24GB になりました。** PyTorch を同梱するのを
@@ -79,7 +116,9 @@ Amatsukaze から呼ぶ場合は[Amatsukaze との連携](#amatsukaze-との連�
 
 同梱物は exe のほかに `LICENSE` / `LICENSE.ffmpeg.txt` /
 `LICENSE.ten-vad.*.txt` / `THIRD-PARTY-NOTICES.md` /
-`whisp-carrier.yaml.example` です。設定ファイルは必須ではありません
+`whisp-carrier.yaml.example` です。AMD 版には ROCm ランタイム4部品の
+`LICENSE.*.txt` も付きます。
+設定ファイルは必須ではありません
 （[設定ファイル](#設定ファイルプロファイル)を使うときだけ `.example` を外してリネームします）。
 
 ## 使い方
@@ -585,8 +624,10 @@ VAD区間数・発話秒数・セグメント数・抑制したループまで�
 | Kotoba-Whisper | 日本語蒸留Whisper。Anime Whisperのベース | Apache-2.0 | https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0 |
 | audio-separator | ボーカル抽出（MDX / Mel-Band-Roformer）。**スクリプト版のみ** | MIT | https://github.com/karaokenerds/python-audio-separator |
 | stable-ts | タイムスタンプ再調整（実験的）。**スクリプト版のみ** | MIT | https://github.com/jianfch/stable-ts |
+| hipBLAS / rocBLAS / rocSOLVER / hipBLASLt | AMD 版の BLAS ランタイム | MIT / BSD + 同梱由来コードの通知 | https://github.com/ROCm/rocm-libraries |
 
-CUDA / cuDNN（NVIDIA）と Intel OpenMP も同梱されています。**同梱しているのは
+NVIDIA 版には CUDA / cuDNN、AMD 版には hipBLAS、両方に Intel OpenMP が同梱されます。
+NVIDIA 版で**同梱しているのは
 CTranslate2 が実際に読み込むもの（cuBLAS・cuDNN・NVRTC・nvJitLink）だけで、
 cuFFT / cuRAND / cuSOLVER / cuSPARSE は 0.9.1 で外しました**（torch が使っていた
 だけのため）。再配布条件は THIRD-PARTY-NOTICES.md に記載しています。

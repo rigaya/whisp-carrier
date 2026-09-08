@@ -2,7 +2,7 @@
 
 [日本語](README.md) | **English**
 
-RTX 5090 (Blackwell / sm_120) native faster-whisper CLI.  
+A faster-whisper CLI for NVIDIA CUDA and AMD ROCm.
 Drop-in replacement for Faster-Whisper-XXL, built on open-source components.
 
 **This is the manual for the distributed exe build.** Running it from Python is a
@@ -19,6 +19,9 @@ exe cannot do is listed [below](#what-the-exe-build-cannot-do).
 
 - **RTX 5090 native** — CTranslate2 on CUDA 12.8 / sm_120 in float16, with no
   compatibility fallback and no need for `-ct float32`
+- **AMD ROCm package** — a separate Windows CTranslate2 ROCm build targeting
+  RDNA3, RDNA3.5 and RDNA4 in float16; exact gfx targets and validation status
+  are listed below
 - **Amatsukaze compatible** — same CLI interface as faster-whisper-xxl.exe
 - **Model aliases** — `-m anime-whisper` for Japanese anime dialogue; any Hugging Face
   Whisper fine-tune is converted to CTranslate2 on first use
@@ -39,8 +42,43 @@ exe cannot do is listed [below](#what-the-exe-build-cannot-do).
 ## Getting started
 
 - Windows 10/11 (x64)
-- NVIDIA RTX GPU with a CUDA 12.8+ driver
-- **No Python, no CUDA Toolkit and no ffmpeg needed** (an LGPL ffmpeg is bundled)
+- NVIDIA package: NVIDIA RTX GPU with a CUDA 12.8+ driver
+- AMD package: Windows 11, a supported Radeon GPU and a current HIP 7 driver
+- **No Python, CUDA/HIP SDK or ffmpeg needed** (an LGPL ffmpeg is bundled)
+
+### AMD GPU targets
+
+The AMD package contains rocBLAS and hipBLASLt kernels for the gfx targets below.
+“Targeted” means that the required gfx kernels are present in the package; it does
+not mean that every listed GPU has been tested. The gfx name reported by the driver
+must appear in this table.
+
+| GPU generation | Bundled gfx targets | Typical product family | Validation |
+|---|---|---|---|
+| RDNA3 | `gfx1100`, `gfx1101`, `gfx1102` | Radeon RX 7000 family | **RX 7900 XT (`gfx1100`) tested** |
+| RDNA3.5 | `gfx1150`, `gfx1151` | Matching integrated Radeon GPUs in Ryzen AI 300 / Ryzen AI Max | Not tested |
+| RDNA4 | `gfx1200`, `gfx1201` | Radeon RX 9000 family | Tested on RX 9060 XT |
+
+RDNA2 `gfx103x` and any gfx target not listed above are outside this package's
+supported target set. A `gfx1036` integrated GPU was enumerated by ROCm during
+testing but could not run this CTranslate2/kernel combination. For an untested GPU,
+compare its `rocminfo` gfx name with the table instead of relying on the marketing
+product name alone.
+
+Verified environments:
+
+- Windows exe: CUDA RTX 2070 / RTX 4080; AMD RX 7900 XT / RX 9060 XT
+- Linux venv: CUDA RTX 2070 / RTX 4080 (WSL2); AMD RX 9060 XT
+
+The NVIDIA and AMD builds are **separate packages**. They can coexist on one PC,
+but must be extracted into different directories. Their `ctranslate2.dll` files
+have the same name and are mutually exclusive, so combining both backends in one
+package would make DLL selection fragile. The AMD executable is
+`whisp-carrier-amd.exe`.
+
+> Sequential inference is the default on both CUDA and AMD; pass `--batched` to opt in to batching.
+> Do not use `--realign` or
+> `--vad_device cuda` in this build; the default TEN VAD already runs on the CPU.
 
 > **If the GPU cannot be used, this does not stop with an error — it keeps going on the CPU.**
 > With a driver older than CUDA 12.8, or no NVIDIA GPU, it falls back to
@@ -51,15 +89,20 @@ exe cannot do is listed [below](#what-the-exe-build-cannot-do).
 > The `device=` line printed at startup tells you which one you got:
 >
 > ```
-> ctranslate2 4.8.1 | device=cuda | compute=float16     <- fine
-> ctranslate2 4.8.1 | device=cpu | compute=int8          <- the GPU is not being used
+> ctranslate2 4.8.1 | backend=cuda | device=cuda | compute=float16  <- NVIDIA
+> ctranslate2 4.8.1 | backend=rocm | device=cuda | compute=float16  <- AMD
+> ctranslate2 4.8.1 | backend=rocm | device=cpu | compute=int8      <- no GPU
 > ```
 >
-> `whisp-carrier.exe --checkcuda` reports the same thing as a number (`0` means no GPU is visible).
+> Adding `--checkcuda` to the executable from either package reports the same
+> thing as a number (`0` means no GPU is visible).
 
-Unpack the archive and run the exe. `LICENSE`, `LICENSE.ffmpeg.txt`,
+Unpack the archive and run `whisp-carrier.exe` for NVIDIA or
+`whisp-carrier-amd.exe` for AMD. The examples below use the NVIDIA filename.
+`LICENSE`, `LICENSE.ffmpeg.txt`,
 `LICENSE.ten-vad.*.txt`, `THIRD-PARTY-NOTICES.md` and
-`whisp-carrier.yaml.example` sit next to it. The config file is optional.
+`whisp-carrier.yaml.example` sit next to it; the AMD package also includes
+four ROCm runtime `LICENSE.*.txt` files. The config file is optional.
 
 ## Usage
 
@@ -468,9 +511,11 @@ everything bundled, with licence texts, is in
 | Kotoba-Whisper | Japanese distilled Whisper, base of Anime Whisper | Apache-2.0 | https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0 |
 | audio-separator | Vocal extraction (MDX / Mel-Band-Roformer); **script version only** | MIT | https://github.com/karaokenerds/python-audio-separator |
 | stable-ts | Timestamp realignment (experimental); **script version only** | MIT | https://github.com/jianfch/stable-ts |
+| hipBLAS / rocBLAS / rocSOLVER / hipBLASLt | BLAS runtime in the AMD package | MIT/BSD plus bundled notices | https://github.com/ROCm/rocm-libraries |
 
-NVIDIA CUDA / cuDNN and Intel OpenMP are also bundled. Only what CTranslate2
-actually loads ships — cuBLAS, cuDNN, NVRTC and nvJitLink — while cuFFT, cuRAND,
+The NVIDIA package bundles CUDA / cuDNN, the AMD package bundles hipBLAS, and
+both bundle Intel OpenMP. On NVIDIA, only what CTranslate2 actually loads ships
+— cuBLAS, cuDNN, NVRTC and nvJitLink — while cuFFT, cuRAND,
 cuSOLVER and cuSPARSE were dropped in 0.9.1 because only torch used them. Their
 redistribution terms are in THIRD-PARTY-NOTICES.md.
 

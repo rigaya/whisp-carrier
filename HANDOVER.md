@@ -2591,16 +2591,135 @@ faster-whisper 1.2.1 の要求は `tokenizers>=0.13,<1` なので問題ない。
 exe のビルド。
 
 ```powershell
-# 通常ビルド（配布用）
-python -m PyInstaller whisp_carrier.spec --noconfirm
+# CUDA通常ビルド（配布用）。backend未指定時もcuda
+Remove-Item Env:WHISP_CARRIER_BACKEND -ErrorAction SilentlyContinue
+python -m PyInstaller whisp_carrier.spec --noconfirm `
+  --distpath dist-slim --workpath build-slim
 
 # フルビルド（--realign の検証用。通常ビルドを上書きしない）
 $env:WHISP_CARRIER_FULL='1'
 python -m PyInstaller whisp_carrier.spec --noconfirm --distpath dist-full --workpath build-full
 ```
 
-ビルド時は spec が ffmpeg のライセンスを検査するので、
-`[spec] ffmpeg verified (known LGPL build)` が出ることを確認する。
-GPL / non-free ビルドを掴んだ場合は SystemExit で止まる。
+AMD 版は CUDA 版と同居させず、別環境・別出力で作る。ROCm wheel の
+`ctranslate2.dll` と CUDA wheel の同名 DLL を一つの `_internal` に置けないため。
+spec は `WHISP_CARRIER_BACKEND` をビルド種別の唯一の選択元にする。未指定は
+`cuda`、AMD版は `rocm` を明示する。インストール済み `ctranslate2.dll` のPE import
+tableは指定との整合性検証にだけ使い、ROCm版なら `hipblas.dll` / `amdhip64_7.dll`
+依存がなければビルドを止める。DLLをロードしない静的検査なので、ビルド機にGPUや
+AMDドライバは不要。選択値は `whisp-carrier-backend.txt` として `_internal` に入り、
+実行時も推測し直さない。出力名は指定に従って `whisp-carrier` / `whisp-carrier-amd` に
+分かれる。
+
+Windowsのスクリプト版も `whisp_backend.py` の同じPE import判定を使う。
+PE解析に使う `pefile` は `requirements.txt` から導入する。
+Linuxのスクリプト版は、venvにインストールしたCTranslate2の共有ライブラリについて
+ELFの動的リンク先を読み、hipBLASなどへの依存があればROCm版と表示する。
+解析に使う `pyelftools` はLinuxでのみ `requirements.txt` から導入する。
+推論に使うCUDA版・ROCm版の選択自体は、各venvにインストールするCTranslate2 wheelで行う。
+
+AMD exe は Python 3.12 の専用 venv で作る。HIP SDK をシステムにインストールする
+必要はない。[AMD公式の ROCm 7.2.1 wheel 配布先](https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/)
+にある `rocm_sdk_libraries_custom` wheel を同じ venv に入れると、必要な BLAS 系 DLL と
+`rocblas/library`・`hipblaslt/library` が venv 内に揃う。spec は
+`WHISP_CARRIER_HIPBLAS` で指定した `hipblas.dll` の親フォルダーからこれらをコピーする。
+ROCm 版 CTranslate2 wheel とは別物なので、両方必要。ビルド機での推論は不要で、
+AMD GPU やドライバも必須ではない。
+
+以下は**リポジトリ直下の PowerShell** から実行し、取得物と出力をリポジトリ内の
+Git 管理外フォルダーに置く手順。別ドライブの一時フォルダーや HIP SDK の標準配置を
+前提にしない。
+
+```powershell
+# AMD専用venvを作る。faster-whisperはrequirements.txtに含まれる
+py -3.12 -m venv _venv_amd
+$python = '.\_venv_amd\Scripts\python.exe'
+& $python -m pip install -r requirements.txt pyinstaller
+if ($LASTEXITCODE -ne 0) { throw 'Python依存関係の導入に失敗' }
+
+# AMD公式のROCm 7.2.1ライブラリwheelをvenvへ導入する。
+# ビルドにはこのwheelのDLLとカーネル資産を使い、ROCm版torchは使わない。
+$rocmLibraries = 'https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl'
+& $python -m pip install --no-deps $rocmLibraries
+if ($LASTEXITCODE -ne 0) { throw 'ROCmライブラリwheelの導入に失敗' }
+$sitePackages = (& $python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])').Trim()
+$rocmBin = Join-Path $sitePackages '_rocm_sdk_libraries_custom\bin'
+foreach ($name in @('hipblas.dll', 'rocblas.dll', 'rocsolver.dll', 'libhipblaslt.dll', 'rocblas\library', 'hipblaslt\library')) {
+  if (-not (Test-Path (Join-Path $rocmBin $name))) { throw "ROCmライブラリwheelに不足: $name" }
+}
+
+# 公式リリースからROCm版CTranslate2 wheelを取得して入れる
+$wheelZip = '.\_venv_amd\rocm-python-wheels-Windows.zip'
+$wheelDir = '.\_venv_amd\rocm-wheels'
+Invoke-WebRequest 'https://github.com/OpenNMT/CTranslate2/releases/download/v4.8.1/rocm-python-wheels-Windows.zip' -OutFile $wheelZip
+Expand-Archive -Path $wheelZip -DestinationPath $wheelDir -Force
+$wheel = Get-ChildItem $wheelDir -Recurse -File -Filter 'ctranslate2-4.8.1-cp312-cp312-win_amd64.whl' | Select-Object -First 1
+if ($null -eq $wheel) { throw 'ROCm版CTranslate2 wheelが見つかりません' }
+& $python -m pip install --force-reinstall --no-deps $wheel.FullName
+if ($LASTEXITCODE -ne 0) { throw 'ROCm版CTranslate2 wheelの導入に失敗' }
+
+# ffmpeg.exe と LICENSE.txt が _tools\ffmpeg\official にない場合は、
+# _tools/ffmpeg/PROVENANCE.txt に従って LGPL 版を取得・配置する。
+# latest はローリングリリース。配布元の checksums.sha256 と照合する。
+$ffmpegDir = '.\_tools\ffmpeg\official'
+if (-not (Test-Path (Join-Path $ffmpegDir 'ffmpeg.exe')) -or
+    -not (Test-Path (Join-Path $ffmpegDir 'LICENSE.txt'))) {
+  $ffmpegZip = '.\_venv_amd\ffmpeg-n8.1-latest-win64-lgpl-8.1.zip'
+  $ffmpegExtract = '.\_venv_amd\ffmpeg-lgpl'
+  $base = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
+  Invoke-WebRequest "$base/ffmpeg-n8.1-latest-win64-lgpl-8.1.zip" -OutFile $ffmpegZip
+  $checksums = (Invoke-WebRequest "$base/checksums.sha256").Content
+  if ($checksums -is [byte[]]) { $checksums = [Text.Encoding]::UTF8.GetString($checksums) }
+  $expected = [regex]::Match($checksums, '(?m)^([0-9a-fA-F]{64})\s+ffmpeg-n8\.1-latest-win64-lgpl-8\.1\.zip\s*$')
+  if (-not $expected.Success -or
+      (Get-FileHash $ffmpegZip -Algorithm SHA256).Hash -ne $expected.Groups[1].Value) {
+    throw 'ffmpeg zipのSHA-256が配布元のchecksums.sha256と一致しない'
+  }
+  Expand-Archive -Path $ffmpegZip -DestinationPath $ffmpegExtract -Force
+  $ffmpegSrc = Join-Path $ffmpegExtract 'ffmpeg-n8.1-latest-win64-lgpl-8.1'
+  New-Item -ItemType Directory -Path $ffmpegDir -Force | Out-Null
+  Copy-Item (Join-Path $ffmpegSrc 'bin\ffmpeg.exe') (Join-Path $ffmpegDir 'ffmpeg.exe')
+  Copy-Item (Join-Path $ffmpegSrc 'LICENSE.txt') (Join-Path $ffmpegDir 'LICENSE.txt')
+}
+
+# 先にフルビルドしたPowerShellでも通常のAMD版を作れるようにする
+Remove-Item Env:WHISP_CARRIER_FULL -ErrorAction SilentlyContinue
+Remove-Item Env:WHISP_CARRIER_WITH_TORCH -ErrorAction SilentlyContinue
+Remove-Item Env:WHISP_CARRIER_HIPBLAS -ErrorAction SilentlyContinue
+$env:WHISP_CARRIER_BACKEND='rocm'
+$env:WHISP_CARRIER_HIPBLAS = Join-Path $rocmBin 'hipblas.dll'
+$env:WHISP_CARRIER_FFMPEG = (Resolve-Path (Join-Path $ffmpegDir 'ffmpeg.exe')).Path
+& $python -m PyInstaller whisp_carrier.spec --noconfirm `
+  --distpath dist-amd --workpath build-amd
+if ($LASTEXITCODE -ne 0) { throw 'AMD版ビルドに失敗' }
+```
+
+出力は `dist-amd\whisp-carrier-amd\whisp-carrier-amd.exe`。
+ビルド後は `_internal\whisp-carrier-backend.txt` が `rocm` で、同じ `_internal` に
+4種の BLAS DLL と `rocblas\library`・`hipblaslt\library` があることを確認する。
+AMD GPU とドライバのある機械なら `whisp-carrier-amd.exe --version` で
+`backend=rocm`、`--checkcuda` で GPU の認識も確認できる。
+
+SDKインストーラを使う場合も spec は対応している。その場合は
+`WHISP_CARRIER_HIPBLAS` を指定しなければ `PATH`、次に
+`C:\Program Files\AMD\ROCm\<version>\bin` を探す。複数版から固定したい場合は
+対応する `hipblas.dll` またはその `bin` フォルダーを指定する。
+`WHISP_CARRIER_BACKEND=rocm` だけではライブラリ一式は揃わない。
+
+AMD 版には `hipblas.dll` だけでなく、その推移依存 `rocblas.dll` / `rocsolver.dll` /
+`libhipblaslt.dll` と `rocblas/library` / `hipblaslt/library` のアーキテクチャ別
+カーネル資産も同梱する。これは公式 7.2.1 wheel の実物を `dumpbin /DEPENDENTS` で
+調べて確定した。4部品それぞれのライセンス文書も配布物へコピーする。
+`amdhip64_7.dll` は同梱せず利用者の Adrenalin ドライバから読む。
+ROCm 7.1 の `libhipblas.dll` を単に改名する方法は ABI 未確認なので spec が拒否する。
+`WHISP_CARRIER_FULL=1` / `WHISP_CARRIER_WITH_TORCH=1` も AMD 版では拒否する。
+Windows の torch 経路に依存する `--realign` / GPU VAD を未検証のまま載せないため。
+
+ビルド時は spec が ffmpeg のライセンスを検査する。既知SHA-256と一致すれば
+`[spec] ffmpeg verified (known LGPL build)` が出る。`latest` の中身が更新されて
+SHA-256警告が出た場合は、上記の配布元チェックサム照合と spec の
+`--enable-gpl` / `--enable-nonfree` 不在の検査結果を確認する。配布に使うなら
+`_tools/ffmpeg/PROVENANCE.txt` と spec の `FFMPEG_KNOWN_SHA256` も新しい実物に合わせて
+更新する。GPL / non-free ビルドを掴んだ場合は SystemExit で止まる。
 
 以上。
